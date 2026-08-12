@@ -1,26 +1,17 @@
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "p2p-chat",
-	"main": "src/index.ts",
-	"compatibility_date": "2026-08-12",
-	"assets": {
-		"directory": "./public",
-		"binding": "ASSETS"
-	},
-	"d1_databases": [
-		{
-			"binding": "DB",
-			"database_name": "p2p-chat",
-			"database_id": "2313cef7-20d9-482a-849a-221b6b2ac51b",
-			"migrations_dir": "migrations",
-			"remote": true
-		}
-	],
-	"kv_namespaces": [
-		{
-			"binding": "EPHEMERAL",
-			"id": "921cdb0eba36455d937bd865ad473155",
-			"remote": true
-		}
-	]
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "p2p-chat",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-12",
+  "assets": { "directory": "./public", "binding": "ASSETS" },
+  "vars": { "MAIL_FROM": "P2P Chat <noreply@YOUR_DOMAIN>" },
+  "send_email": [
+    { "name": "EMAIL" }
+  ],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "p2p-chat", "database_id": "2313cef7-20d9-482a-849a-221b6b2ac51b", "migrations_dir": "migrations", "remote": true }
+  ],
+  "kv_namespaces": [
+    { "binding": "EPHEMERAL", "id": "921cdb0eba36455d937bd865ad473155", "remote": true }
+  ]
 }

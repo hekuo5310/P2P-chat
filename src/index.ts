@@ -1,4 +1,4 @@
-export interface Env { DB: D1Database; EPHEMERAL: KVNamespace; ASSETS: Fetcher }
+export interface Env { DB: D1Database; EPHEMERAL: KVNamespace; ASSETS: Fetcher; EMAIL: SendEmail; MAIL_FROM: string }
 type Json = Record<string, unknown>;
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
 const bad = (message: string, status = 400) => json({ error: message }, status);
@@ -16,6 +16,10 @@ async function auth(request: Request, env: Env) {
 async function member(env: Env, groupId: string, userId: string) { return !!await env.DB.prepare("SELECT 1 FROM group_members WHERE group_id=? AND user_id=?").bind(groupId, userId).first(); }
 async function message(env: Env, groupId: string, messageId: string) { return env.EPHEMERAL.get(`group:${groupId}:message:${messageId}`, "json") as Promise<GroupMessage | null>; }
 type GroupMessage = { id:string; senderId:string; ciphertext:unknown; wrappedKeys:Record<string, unknown>; recipients:string[]; receipts:string[]; createdAt:number };
+const email = (x: unknown) => typeof x === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x.trim()) && x.length <= 254 ? x.trim().toLowerCase() : null;
+async function sendCode(env: Env, to: string, code: string) {
+  await env.EMAIL.send({ from: env.MAIL_FROM, to, subject: "P2P Chat 登录验证码", text: `你的 P2P Chat 验证码是：${code}。10 分钟内有效；若不是你本人操作，请忽略此邮件。`, html: `<div style=\"font-family:Arial,sans-serif\"><h2>P2P Chat</h2><p>你的验证码是：</p><p style=\"font-size:28px;letter-spacing:6px;font-weight:700\">${code}</p><p>10 分钟内有效。若不是你本人操作，请忽略此邮件。</p></div>` });
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -23,12 +27,25 @@ export default {
     if (!path.startsWith("/api/")) return env.ASSETS.fetch(request);
     if (request.method === "OPTIONS") return new Response(null, { headers: { "access-control-allow-origin": url.origin, "access-control-allow-headers": "content-type, authorization, x-user-id", "access-control-allow-methods": "GET,POST,OPTIONS" } });
     try {
-      if (path === "/api/users" && request.method === "POST") {
-        const x = await body(request); const displayName = text(x?.displayName, 40); const encryptionKey = text(x?.encryptionKey, 4096);
-        if (!displayName || !encryptionKey) return bad("displayName and encryptionKey are required");
-        const userId = id(), token = b64(crypto.getRandomValues(new Uint8Array(32)));
-        await env.DB.prepare("INSERT INTO users (id,display_name,encryption_key,token_hash,created_at) VALUES (?,?,?,?,?)").bind(userId, displayName, encryptionKey, await hash(token), Date.now()).run();
-        return json({ id: userId, token, displayName, encryptionKey });
+      if (path === "/api/auth/request-code" && request.method === "POST") {
+        const x = await body(request), address = email(x?.email), displayName = text(x?.displayName, 40), encryptionKey = text(x?.encryptionKey, 4096);
+        if (!address || !displayName || !encryptionKey) return bad("email, displayName and encryptionKey are required");
+        if (await env.EPHEMERAL.get(`auth:cooldown:${address}`)) return bad("请稍后再请求验证码", 429);
+        const code = String(crypto.getRandomValues(new Uint32Array(1))[0] % 900000 + 100000);
+        await sendCode(env, address, code);
+        await env.EPHEMERAL.put(`auth:code:${address}`, JSON.stringify({ codeHash: await hash(code), displayName, encryptionKey }), { expirationTtl: 600 });
+        await env.EPHEMERAL.put(`auth:cooldown:${address}`, "1", { expirationTtl: 60 });
+        return json({ ok: true, expiresIn: 600 });
+      }
+      if (path === "/api/auth/verify-code" && request.method === "POST") {
+        const x = await body(request), address = email(x?.email), code = text(x?.code, 6); if (!address || !code) return bad("email and 6 digit code are required");
+        const pending = await env.EPHEMERAL.get<{codeHash:string;displayName:string;encryptionKey:string}>(`auth:code:${address}`, "json");
+        if (!pending || pending.codeHash !== await hash(code)) return bad("验证码无效或已过期", 401);
+        let user = await env.DB.prepare("SELECT id,display_name,encryption_key FROM users WHERE email=?").bind(address).first<{id:string;display_name:string;encryption_key:string}>();
+        const token = b64(crypto.getRandomValues(new Uint8Array(32)));
+        if (user) { await env.DB.prepare("UPDATE users SET token_hash=?, display_name=?, encryption_key=? WHERE id=?").bind(await hash(token), pending.displayName, pending.encryptionKey, user.id).run(); user = { ...user, display_name: pending.displayName, encryption_key: pending.encryptionKey }; }
+        else { const userId = id(); await env.DB.prepare("INSERT INTO users (id,email,display_name,encryption_key,token_hash,created_at) VALUES (?,?,?,?,?,?)").bind(userId,address,pending.displayName,pending.encryptionKey,await hash(token),Date.now()).run(); user={id:userId,display_name:pending.displayName,encryption_key:pending.encryptionKey}; }
+        await env.EPHEMERAL.delete(`auth:code:${address}`); return json({ id:user.id, token, displayName:user.display_name, email:address, encryptionKey:user.encryption_key });
       }
       const userMatch = path.match(/^\/api\/users\/([\w-]+)$/);
       if (userMatch && request.method === "GET") {
