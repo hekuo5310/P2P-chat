@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "p2p-chat",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-12",
+  "assets": { "directory": "./public", "binding": "ASSETS" },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "p2p-chat", "database_id": "REPLACE_WITH_D1_DATABASE_ID", "migrations_dir": "migrations" }
+  ],
+  "kv_namespaces": [
+    { "binding": "EPHEMERAL", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }
+  ]
+}
