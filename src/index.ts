@@ -62,10 +62,11 @@ export default {
         await env.EPHEMERAL.put(`auth:cooldown:${address}`,"1",{expirationTtl:60});return json({ok:true,expiresIn:600});
       }
       if(path==="/api/auth/verify-code"&&request.method==="POST"){
-        const x=await body(request),address=email(x?.email),code=text(x?.code,6),password=text(x?.password,256);
-        if(!address||!code||!password||password.length<10)return bad("邮箱、6 位验证码和至少 10 位密码必填");
+        const x=await body(request),address=email(x?.email),code=text(x?.code,6),password=text(x?.password,256),timestamp=x?.timestamp;
+        if(!address||!code||!password||password.length<10||!freshTimestamp(timestamp))return bad("注册请求参数不完整或已过期");
         const pending=await env.EPHEMERAL.get<{codeHash:string;displayName:string;encryptionKey:string;signingKey:string}>(`auth:register:${address}`,"json");
         if(!pending||pending.codeHash!==await hash(code))return bad("验证码无效或已过期",401);
+        if(!await verifyDeviceProof(pending.signingKey,`register-verify|${address}|${code}|${timestamp}`,x?.signature))return bad("注册设备签名无效",403);
         if(await env.DB.prepare("SELECT 1 FROM users WHERE email=?").bind(address).first())return bad("该邮箱已注册",409);
         const userId=id(),token=b64(crypto.getRandomValues(new Uint8Array(32))),salt=b64(crypto.getRandomValues(new Uint8Array(16)));
         await env.DB.prepare("INSERT INTO users (id,email,display_name,encryption_key,signing_key,token_hash,created_at,password_salt,password_hash) VALUES (?,?,?,?,?,?,?,?,?)").bind(userId,address,pending.displayName,pending.encryptionKey,pending.signingKey,await hash(token),Date.now(),salt,await passwordHash(password,salt)).run();
