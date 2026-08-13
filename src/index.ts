@@ -5,6 +5,7 @@ const bad = (message: string, status = 400) => json({ error: message }, status);
 const id = () => crypto.randomUUID();
 const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
 async function hash(value: string) { return b64(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)))); }
+async function passwordHash(password:string,salt:string){const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveBits"]);return b64(new Uint8Array(await crypto.subtle.deriveBits({name:"PBKDF2",hash:"SHA-256",salt:Uint8Array.from(atob(salt),c=>c.charCodeAt(0)),iterations:310000},key,256)));}
 async function body(request: Request): Promise<Json | null> { try { const x = await request.json(); return x && typeof x === "object" ? x as Json : null; } catch { return null; } }
 function text(x: unknown, max = 200) { return typeof x === "string" && x.trim() && x.length <= max ? x.trim() : null; }
 async function auth(request: Request, env: Env) {
@@ -28,25 +29,26 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { headers: { "access-control-allow-origin": url.origin, "access-control-allow-headers": "content-type, authorization, x-user-id", "access-control-allow-methods": "GET,POST,OPTIONS" } });
     try {
       if (path === "/api/auth/request-code" && request.method === "POST") {
-        const x = await body(request), address = email(x?.email), displayName = text(x?.displayName, 40), encryptionKey = text(x?.encryptionKey, 4096), signingKey = text(x?.signingKey, 4096);
-        if (!address || !displayName || !encryptionKey || !signingKey) return bad("email, displayName, encryptionKey and signingKey are required");
+        const x = await body(request), address = email(x?.email), displayName = text(x?.displayName, 40), encryptionKey = text(x?.encryptionKey, 4096), signingKey = text(x?.signingKey, 4096), password = text(x?.password, 256);
+        if (!address || !displayName || !encryptionKey || !signingKey || !password) return bad("email, displayName, encryptionKey, signingKey and password are required");
         if (await env.EPHEMERAL.get(`auth:cooldown:${address}`)) return bad("请稍后再请求验证码", 429);
         const code = String(crypto.getRandomValues(new Uint32Array(1))[0] % 900000 + 100000);
         await sendCode(env, address, code);
-        await env.EPHEMERAL.put(`auth:code:${address}`, JSON.stringify({ codeHash: await hash(code), displayName, encryptionKey, signingKey }), { expirationTtl: 600 });
+        await env.EPHEMERAL.put(`auth:code:${address}`, JSON.stringify({ codeHash: await hash(code), displayName, encryptionKey, signingKey, password }), { expirationTtl: 600 });
         await env.EPHEMERAL.put(`auth:cooldown:${address}`, "1", { expirationTtl: 60 });
         return json({ ok: true, expiresIn: 600 });
       }
       if (path === "/api/auth/verify-code" && request.method === "POST") {
         const x = await body(request), address = email(x?.email), code = text(x?.code, 6); if (!address || !code) return bad("email and 6 digit code are required");
-        const pending = await env.EPHEMERAL.get<{codeHash:string;displayName:string;encryptionKey:string;signingKey:string}>(`auth:code:${address}`, "json");
+        const pending = await env.EPHEMERAL.get<{codeHash:string;displayName:string;encryptionKey:string;signingKey:string;password:string}>(`auth:code:${address}`, "json");
         if (!pending || pending.codeHash !== await hash(code)) return bad("验证码无效或已过期", 401);
         let user = await env.DB.prepare("SELECT id,display_name,encryption_key,signing_key FROM users WHERE email=?").bind(address).first<{id:string;display_name:string;encryption_key:string}>();
         const token = b64(crypto.getRandomValues(new Uint8Array(32)));
         if (user) { await env.DB.prepare("UPDATE users SET token_hash=?, display_name=? WHERE id=?").bind(await hash(token), pending.displayName, user.id).run(); user = { ...user, display_name: pending.displayName }; }
-        else { const userId = id(); await env.DB.prepare("INSERT INTO users (id,email,display_name,encryption_key,signing_key,token_hash,created_at) VALUES (?,?,?,?,?,?,?)").bind(userId,address,pending.displayName,pending.encryptionKey,pending.signingKey,await hash(token),Date.now()).run(); user={id:userId,display_name:pending.displayName,encryption_key:pending.encryptionKey,signing_key:pending.signingKey}; }
+        else { const userId = id(); await env.DB.prepare("INSERT INTO users (id,email,display_name,encryption_key,signing_key,token_hash,created_at,password_salt,password_hash) VALUES (?,?,?,?,?,?,?,?,?)").bind(userId,address,pending.displayName,pending.encryptionKey,pending.signingKey,await hash(token),Date.now(),b64(crypto.getRandomValues(new Uint8Array(16))),"").run(); user={id:userId,display_name:pending.displayName,encryption_key:pending.encryptionKey,signing_key:pending.signingKey}; }
         await env.EPHEMERAL.delete(`auth:code:${address}`); return json({ id:user.id, token, displayName:user.display_name, email:address, encryptionKey:user.encryption_key });
       }
+      if (path === "/api/auth/password" && request.method === "POST") { const x=await body(request),address=email(x?.email),password=text(x?.password,256); if(!address||!password)return bad("email and password required"); const u=await env.DB.prepare("SELECT id,display_name,encryption_key,signing_key,password_salt,password_hash FROM users WHERE email=?").bind(address).first<any>(); if(!u||!u.password_salt||!u.password_hash||u.password_hash!==await passwordHash(password,u.password_salt))return bad("邮箱或密码错误",401); const token=b64(crypto.getRandomValues(new Uint8Array(32))); await env.DB.prepare("UPDATE users SET token_hash=? WHERE id=?").bind(await hash(token),u.id).run(); return json({id:u.id,token,displayName:u.display_name,email:address,encryptionKey:u.encryption_key,signingKey:u.signing_key}); }
       const userMatch = path.match(/^\/api\/users\/([\w-]+)$/);
       if (userMatch && request.method === "GET") {
         const user = await env.DB.prepare("SELECT id,display_name,encryption_key,signing_key FROM users WHERE id=?").bind(userMatch[1]).first(); return user ? json(user) : bad("user not found", 404);
