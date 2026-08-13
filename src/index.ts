@@ -10,7 +10,7 @@ function text(x: unknown, max = 200) { return typeof x === "string" && x.trim() 
 async function auth(request: Request, env: Env) {
   const userId = request.headers.get("x-user-id"); const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
   if (!userId || !token) return null;
-  const user = await env.DB.prepare("SELECT id, display_name, encryption_key FROM users WHERE id = ? AND token_hash = ?").bind(userId, await hash(token)).first<{id:string;display_name:string;encryption_key:string}>();
+  const user = await env.DB.prepare("SELECT id, display_name, encryption_key FROM users WHERE id = ? AND token_hash = ?").bind(userId, await hash(token)).first<{id:string;display_name:string;encryption_key:string;signing_key:string}>();
   return user ?? null;
 }
 async function member(env: Env, groupId: string, userId: string) { return !!await env.DB.prepare("SELECT 1 FROM group_members WHERE group_id=? AND user_id=?").bind(groupId, userId).first(); }
@@ -28,23 +28,23 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { headers: { "access-control-allow-origin": url.origin, "access-control-allow-headers": "content-type, authorization, x-user-id", "access-control-allow-methods": "GET,POST,OPTIONS" } });
     try {
       if (path === "/api/auth/request-code" && request.method === "POST") {
-        const x = await body(request), address = email(x?.email), displayName = text(x?.displayName, 40), encryptionKey = text(x?.encryptionKey, 4096);
-        if (!address || !displayName || !encryptionKey) return bad("email, displayName and encryptionKey are required");
+        const x = await body(request), address = email(x?.email), displayName = text(x?.displayName, 40), encryptionKey = text(x?.encryptionKey, 4096), signingKey = text(x?.signingKey, 4096);
+        if (!address || !displayName || !encryptionKey || !signingKey) return bad("email, displayName, encryptionKey and signingKey are required");
         if (await env.EPHEMERAL.get(`auth:cooldown:${address}`)) return bad("请稍后再请求验证码", 429);
         const code = String(crypto.getRandomValues(new Uint32Array(1))[0] % 900000 + 100000);
         await sendCode(env, address, code);
-        await env.EPHEMERAL.put(`auth:code:${address}`, JSON.stringify({ codeHash: await hash(code), displayName, encryptionKey }), { expirationTtl: 600 });
+        await env.EPHEMERAL.put(`auth:code:${address}`, JSON.stringify({ codeHash: await hash(code), displayName, encryptionKey, signingKey }), { expirationTtl: 600 });
         await env.EPHEMERAL.put(`auth:cooldown:${address}`, "1", { expirationTtl: 60 });
         return json({ ok: true, expiresIn: 600 });
       }
       if (path === "/api/auth/verify-code" && request.method === "POST") {
         const x = await body(request), address = email(x?.email), code = text(x?.code, 6); if (!address || !code) return bad("email and 6 digit code are required");
-        const pending = await env.EPHEMERAL.get<{codeHash:string;displayName:string;encryptionKey:string}>(`auth:code:${address}`, "json");
+        const pending = await env.EPHEMERAL.get<{codeHash:string;displayName:string;encryptionKey:string;signingKey:string}>(`auth:code:${address}`, "json");
         if (!pending || pending.codeHash !== await hash(code)) return bad("验证码无效或已过期", 401);
-        let user = await env.DB.prepare("SELECT id,display_name,encryption_key FROM users WHERE email=?").bind(address).first<{id:string;display_name:string;encryption_key:string}>();
+        let user = await env.DB.prepare("SELECT id,display_name,encryption_key,signing_key FROM users WHERE email=?").bind(address).first<{id:string;display_name:string;encryption_key:string}>();
         const token = b64(crypto.getRandomValues(new Uint8Array(32)));
-        if (user) { await env.DB.prepare("UPDATE users SET token_hash=?, display_name=?, encryption_key=? WHERE id=?").bind(await hash(token), pending.displayName, pending.encryptionKey, user.id).run(); user = { ...user, display_name: pending.displayName, encryption_key: pending.encryptionKey }; }
-        else { const userId = id(); await env.DB.prepare("INSERT INTO users (id,email,display_name,encryption_key,token_hash,created_at) VALUES (?,?,?,?,?,?)").bind(userId,address,pending.displayName,pending.encryptionKey,await hash(token),Date.now()).run(); user={id:userId,display_name:pending.displayName,encryption_key:pending.encryptionKey}; }
+        if (user) { await env.DB.prepare("UPDATE users SET token_hash=?, display_name=? WHERE id=?").bind(await hash(token), pending.displayName, user.id).run(); user = { ...user, display_name: pending.displayName }; }
+        else { const userId = id(); await env.DB.prepare("INSERT INTO users (id,email,display_name,encryption_key,signing_key,token_hash,created_at) VALUES (?,?,?,?,?,?,?)").bind(userId,address,pending.displayName,pending.encryptionKey,pending.signingKey,await hash(token),Date.now()).run(); user={id:userId,display_name:pending.displayName,encryption_key:pending.encryptionKey,signing_key:pending.signingKey}; }
         await env.EPHEMERAL.delete(`auth:code:${address}`); return json({ id:user.id, token, displayName:user.display_name, email:address, encryptionKey:user.encryption_key });
       }
       const userMatch = path.match(/^\/api\/users\/([\w-]+)$/);
