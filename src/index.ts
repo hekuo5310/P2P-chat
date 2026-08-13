@@ -20,12 +20,23 @@ function freshTimestamp(value:unknown) { return typeof value === "number" && Mat
 let authSchemaReady=false;
 async function ensureAuthSchema(env:Env){
   if(authSchemaReady)return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT, display_name TEXT NOT NULL, encryption_key TEXT NOT NULL, signing_key TEXT, token_hash TEXT NOT NULL, password_salt TEXT, password_hash TEXT, created_at INTEGER NOT NULL)").run();
   const info=await env.DB.prepare("PRAGMA table_info(users)").all<{name:string}>();
   const names=new Set(info.results.map(column=>column.name));
-  for(const [name,sql] of [["password_salt","ALTER TABLE users ADD COLUMN password_salt TEXT"],["password_hash","ALTER TABLE users ADD COLUMN password_hash TEXT"]] as const){
-    if(!names.has(name)){try{await env.DB.prepare(sql).run()}catch(error){if(!String(error).includes("duplicate column"))throw error}}
+  const requiredColumns=[
+    ["email","ALTER TABLE users ADD COLUMN email TEXT"],
+    ["signing_key","ALTER TABLE users ADD COLUMN signing_key TEXT"],
+    ["password_salt","ALTER TABLE users ADD COLUMN password_salt TEXT"],
+    ["password_hash","ALTER TABLE users ADD COLUMN password_hash TEXT"]
+  ] as const;
+  for(const [name,sql] of requiredColumns){
+    if(!names.has(name)){
+      try{await env.DB.prepare(sql).run()}
+      catch(error){if(!String(error).toLowerCase().includes("duplicate column"))throw error}
+    }
   }
-  await env.DB.prepare("CREATE INDEX IF NOT EXISTS users_email_password ON users(email)").run();authSchemaReady=true;
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS users_email_password ON users(email)").run();
+  authSchemaReady=true;
 }
 
 async function body(request: Request): Promise<Json | null> { try { const x = await request.json(); return x && typeof x === "object" ? x as Json : null; } catch { return null; } }
