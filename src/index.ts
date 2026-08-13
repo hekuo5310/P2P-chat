@@ -69,7 +69,8 @@ export default {
         if(!await verifyDeviceProof(pending.signingKey,`register-verify|${address}|${code}|${timestamp}`,x?.signature))return bad("注册设备签名无效",403);
         if(await env.DB.prepare("SELECT 1 FROM users WHERE email=?").bind(address).first())return bad("该邮箱已注册",409);
         const userId=id(),token=b64(crypto.getRandomValues(new Uint8Array(32))),salt=b64(crypto.getRandomValues(new Uint8Array(16)));
-        await env.DB.prepare("INSERT INTO users (id,email,display_name,encryption_key,signing_key,token_hash,created_at,password_salt,password_hash) VALUES (?,?,?,?,?,?,?,?,?)").bind(userId,address,pending.displayName,pending.encryptionKey,pending.signingKey,await hash(token),Date.now(),salt,await passwordHash(password,salt)).run();
+        let derivedPassword:string;try{derivedPassword=await passwordHash(password,salt)}catch(error){console.error("password derivation failed",error);return bad("密码安全处理失败，请稍后重试",503)}
+        try{await env.DB.prepare("INSERT INTO users (id,email,display_name,encryption_key,signing_key,token_hash,created_at,password_salt,password_hash) VALUES (?,?,?,?,?,?,?,?,?)").bind(userId,address,pending.displayName,pending.encryptionKey,pending.signingKey,await hash(token),Date.now(),salt,derivedPassword).run()}catch(error){console.error("account insert failed",error);return bad("账户写入失败：D1 数据库结构尚未更新，请重新部署后重试",503)}
         await env.EPHEMERAL.delete(`auth:register:${address}`);return json({id:userId,token,displayName:pending.displayName,email:address,encryptionKey:pending.encryptionKey,signingKey:pending.signingKey});
       }
       if(path==="/api/auth/login-code/request"&&request.method==="POST"){
