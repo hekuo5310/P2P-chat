@@ -17,6 +17,17 @@ async function verifyDeviceProof(signingKey:string, payload:string, signature:un
 }
 function freshTimestamp(value:unknown) { return typeof value === "number" && Math.abs(Date.now() - value) <= 300000; }
 
+let authSchemaReady=false;
+async function ensureAuthSchema(env:Env){
+  if(authSchemaReady)return;
+  const info=await env.DB.prepare("PRAGMA table_info(users)").all<{name:string}>();
+  const names=new Set(info.results.map(column=>column.name));
+  for(const [name,sql] of [["password_salt","ALTER TABLE users ADD COLUMN password_salt TEXT"],["password_hash","ALTER TABLE users ADD COLUMN password_hash TEXT"]] as const){
+    if(!names.has(name)){try{await env.DB.prepare(sql).run()}catch(error){if(!String(error).includes("duplicate column"))throw error}}
+  }
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS users_email_password ON users(email)").run();authSchemaReady=true;
+}
+
 async function body(request: Request): Promise<Json | null> { try { const x = await request.json(); return x && typeof x === "object" ? x as Json : null; } catch { return null; } }
 function text(x: unknown, max = 200) { return typeof x === "string" && x.trim() && x.length <= max ? x.trim() : null; }
 async function auth(request: Request, env: Env) {
@@ -39,6 +50,7 @@ export default {
     if (!path.startsWith("/api/")) return env.ASSETS.fetch(request);
     if (request.method === "OPTIONS") return new Response(null, { headers: { "access-control-allow-origin": url.origin, "access-control-allow-headers": "content-type, authorization, x-user-id", "access-control-allow-methods": "GET,POST,OPTIONS" } });
     try {
+      if(path.startsWith("/api/auth/"))await ensureAuthSchema(env);
       if (path === "/api/auth/request-code" && request.method === "POST") {
         const x=await body(request),address=email(x?.email),displayName=text(x?.displayName,40),encryptionKey=text(x?.encryptionKey,4096),signingKey=text(x?.signingKey,4096);
         if(!address||!displayName||!encryptionKey||!signingKey)return bad("请完整填写注册资料",400);
@@ -122,6 +134,6 @@ export default {
       const receipt=path.match(/^\/api\/groups\/([\w-]+)\/messages\/([\w-]+)\/receipt$/);
       if(receipt && request.method==="POST"){const [groupId,messageId]=[receipt[1],receipt[2]];if(!await member(env,groupId,me.id))return bad("not a member",403);const m=await message(env,groupId,messageId);if(!m)return bad("message not found",404);if(!m.recipients.includes(me.id))return bad("sender cannot acknowledge",403);if(!m.receipts.includes(me.id)){m.receipts.push(me.id);await env.EPHEMERAL.put(`group:${groupId}:message:${messageId}`,JSON.stringify(m),{expirationTtl:86400});}return json({ok:true,released:m.recipients.every(r=>m.receipts.includes(r))});}
       return bad("not found",404);
-    } catch (error) { console.error(error); return bad("server error",500); }
+    } catch (error) { console.error(error); const detail=String(error); if(detail.includes("D1")||detail.includes("SQL")||detail.includes("column")||detail.includes("table"))return bad("数据库结构初始化失败，请重新部署后重试",503); return bad("server error",500); }
   }
 } satisfies ExportedHandler<Env>;
