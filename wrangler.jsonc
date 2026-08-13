@@ -4,7 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-12",
   "assets": { "directory": "./public", "binding": "ASSETS" },
-  "vars": { "MAIL_FROM": "P2P Chat <noreply@YOUR_DOMAIN>" },
+  "vars": { "MAIL_FROM": "P2P Chat <noreply@d-dos.cc>" },
   "send_email": [
     { "name": "EMAIL" }
   ],
