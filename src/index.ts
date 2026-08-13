@@ -33,7 +33,7 @@ export default {
         if (!address || !displayName || !encryptionKey || !signingKey || !password) return bad("email, displayName, encryptionKey, signingKey and password are required");
         if (await env.EPHEMERAL.get(`auth:cooldown:${address}`)) return bad("请稍后再请求验证码", 429);
         const code = String(crypto.getRandomValues(new Uint32Array(1))[0] % 900000 + 100000);
-        await sendCode(env, address, code);
+        try { await sendCode(env, address, code); } catch (error) { console.error("email delivery failed", error); return bad("验证码邮件发送失败：请检查 Cloudflare Email Service、EMAIL 绑定和 MAIL_FROM 发件地址", 503); }
         await env.EPHEMERAL.put(`auth:code:${address}`, JSON.stringify({ codeHash: await hash(code), displayName, encryptionKey, signingKey, password }), { expirationTtl: 600 });
         await env.EPHEMERAL.put(`auth:cooldown:${address}`, "1", { expirationTtl: 60 });
         return json({ ok: true, expiresIn: 600 });
@@ -45,7 +45,7 @@ export default {
         let user = await env.DB.prepare("SELECT id,display_name,encryption_key,signing_key FROM users WHERE email=?").bind(address).first<{id:string;display_name:string;encryption_key:string}>();
         const token = b64(crypto.getRandomValues(new Uint8Array(32)));
         if (user) { await env.DB.prepare("UPDATE users SET token_hash=?, display_name=? WHERE id=?").bind(await hash(token), pending.displayName, user.id).run(); user = { ...user, display_name: pending.displayName }; }
-        else { const userId = id(); await env.DB.prepare("INSERT INTO users (id,email,display_name,encryption_key,signing_key,token_hash,created_at,password_salt,password_hash) VALUES (?,?,?,?,?,?,?,?,?)").bind(userId,address,pending.displayName,pending.encryptionKey,pending.signingKey,await hash(token),Date.now(),b64(crypto.getRandomValues(new Uint8Array(16))),"").run(); user={id:userId,display_name:pending.displayName,encryption_key:pending.encryptionKey,signing_key:pending.signingKey}; }
+        else { const userId = id(), salt=b64(crypto.getRandomValues(new Uint8Array(16))); await env.DB.prepare("INSERT INTO users (id,email,display_name,encryption_key,signing_key,token_hash,created_at,password_salt,password_hash) VALUES (?,?,?,?,?,?,?,?,?)").bind(userId,address,pending.displayName,pending.encryptionKey,pending.signingKey,await hash(token),Date.now(),salt,await passwordHash(pending.password,salt)).run(); user={id:userId,display_name:pending.displayName,encryption_key:pending.encryptionKey,signing_key:pending.signingKey}; }
         await env.EPHEMERAL.delete(`auth:code:${address}`); return json({ id:user.id, token, displayName:user.display_name, email:address, encryptionKey:user.encryption_key });
       }
       if (path === "/api/auth/password" && request.method === "POST") { const x=await body(request),address=email(x?.email),password=text(x?.password,256); if(!address||!password)return bad("email and password required"); const u=await env.DB.prepare("SELECT id,display_name,encryption_key,signing_key,password_salt,password_hash FROM users WHERE email=?").bind(address).first<any>(); if(!u||!u.password_salt||!u.password_hash||u.password_hash!==await passwordHash(password,u.password_salt))return bad("邮箱或密码错误",401); const token=b64(crypto.getRandomValues(new Uint8Array(32))); await env.DB.prepare("UPDATE users SET token_hash=? WHERE id=?").bind(await hash(token),u.id).run(); return json({id:u.id,token,displayName:u.display_name,email:address,encryptionKey:u.encryption_key,signingKey:u.signing_key}); }
