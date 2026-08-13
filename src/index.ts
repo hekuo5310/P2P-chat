@@ -15,7 +15,7 @@ async function auth(request: Request, env: Env) {
 }
 async function member(env: Env, groupId: string, userId: string) { return !!await env.DB.prepare("SELECT 1 FROM group_members WHERE group_id=? AND user_id=?").bind(groupId, userId).first(); }
 async function message(env: Env, groupId: string, messageId: string) { return env.EPHEMERAL.get(`group:${groupId}:message:${messageId}`, "json") as Promise<GroupMessage | null>; }
-type GroupMessage = { id:string; senderId:string; ciphertext:unknown; wrappedKeys:Record<string, unknown>; recipients:string[]; receipts:string[]; createdAt:number };
+type GroupMessage = { id:string; senderId:string; ciphertext:unknown; wrappedKeys:Record<string, unknown>; signature:string; recipients:string[]; receipts:string[]; createdAt:number };
 const email = (x: unknown) => typeof x === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x.trim()) && x.length <= 254 ? x.trim().toLowerCase() : null;
 async function sendCode(env: Env, to: string, code: string) {
   await env.EMAIL.send({ from: env.MAIL_FROM, to, subject: "P2P Chat 登录验证码", text: `你的 P2P Chat 验证码是：${code}。10 分钟内有效；若不是你本人操作，请忽略此邮件。`, html: `<div style=\"font-family:Arial,sans-serif\"><h2>P2P Chat</h2><p>你的验证码是：</p><p style=\"font-size:28px;letter-spacing:6px;font-weight:700\">${code}</p><p>10 分钟内有效。若不是你本人操作，请忽略此邮件。</p></div>` });
@@ -49,7 +49,7 @@ export default {
       }
       const userMatch = path.match(/^\/api\/users\/([\w-]+)$/);
       if (userMatch && request.method === "GET") {
-        const user = await env.DB.prepare("SELECT id,display_name,encryption_key FROM users WHERE id=?").bind(userMatch[1]).first(); return user ? json(user) : bad("user not found", 404);
+        const user = await env.DB.prepare("SELECT id,display_name,encryption_key,signing_key FROM users WHERE id=?").bind(userMatch[1]).first(); return user ? json(user) : bad("user not found", 404);
       }
       if (path === "/api/users/search" && request.method === "GET") {
         const q = url.searchParams.get("q")?.trim() ?? ""; if (!q) return json([]);
@@ -62,7 +62,7 @@ export default {
       if (path === "/api/signals" && request.method === "POST") {
         const x = await body(request), to = text(x?.to, 64), sessionId = text(x?.sessionId, 100), type = text(x?.type, 12);
         if (!to || !sessionId || !["offer", "answer"].includes(type ?? "") || x?.payload === undefined) return bad("invalid signal");
-        await env.EPHEMERAL.put(`signal:${to}:${sessionId}:${type}`, JSON.stringify({ from: me.id, payload: x.payload }), { expirationTtl: 600 }); return json({ ok: true });
+        await env.EPHEMERAL.put(`signal:${to}:${sessionId}:${type}`, JSON.stringify({ from: me.id, payload: x.payload, signature: x.signature }), { expirationTtl: 600 }); return json({ ok: true });
       }
       const signal = path.match(/^\/api\/signals\/([\w-]+)$/);
       if (signal && request.method === "GET") { const offer = await env.EPHEMERAL.get(`signal:${me.id}:${signal[1]}:offer`, "json"); const answer = await env.EPHEMERAL.get(`signal:${me.id}:${signal[1]}:answer`, "json"); return json({ offer, answer }); }
@@ -72,16 +72,16 @@ export default {
       }
       if (path === "/api/groups" && request.method === "GET") { const r = await env.DB.prepare("SELECT g.id,g.title,g.owner_id,g.created_at FROM chat_groups g JOIN group_members m ON m.group_id=g.id WHERE m.user_id=? ORDER BY g.created_at DESC").bind(me.id).all(); return json(r.results); }
       const group = path.match(/^\/api\/groups\/([\w-]+)$/);
-      if (group && request.method === "GET") { if (!await member(env, group[1], me.id)) return bad("not a member",403); const g=await env.DB.prepare("SELECT id,title,owner_id,created_at FROM chat_groups WHERE id=?").bind(group[1]).first(); const ms=await env.DB.prepare("SELECT u.id,u.display_name,u.encryption_key FROM users u JOIN group_members m ON m.user_id=u.id WHERE m.group_id=?").bind(group[1]).all(); return g?json({...g,members:ms.results}):bad("group not found",404); }
+      if (group && request.method === "GET") { if (!await member(env, group[1], me.id)) return bad("not a member",403); const g=await env.DB.prepare("SELECT id,title,owner_id,created_at FROM chat_groups WHERE id=?").bind(group[1]).first(); const ms=await env.DB.prepare("SELECT u.id,u.display_name,u.encryption_key,u.signing_key FROM users u JOIN group_members m ON m.user_id=u.id WHERE m.group_id=?").bind(group[1]).all(); return g?json({...g,members:ms.results}):bad("group not found",404); }
       const members = path.match(/^\/api\/groups\/([\w-]+)\/members$/);
       if (members && request.method === "POST") { const x=await body(request), userId=text(x?.userId,64); const g=await env.DB.prepare("SELECT owner_id FROM chat_groups WHERE id=?").bind(members[1]).first<{owner_id:string}>(); if(!g)return bad("group not found",404); if(g.owner_id!==me.id)return bad("only owner can add members",403); if(!userId || !await env.DB.prepare("SELECT 1 FROM users WHERE id=?").bind(userId).first())return bad("user not found",404); await env.DB.prepare("INSERT OR IGNORE INTO group_members (group_id,user_id,joined_at) VALUES (?,?,?)").bind(members[1],userId,Date.now()).run(); return json({ok:true}); }
       const messages = path.match(/^\/api\/groups\/([\w-]+)\/messages$/);
       if (messages && request.method === "POST") {
-        const groupId=messages[1]; if(!await member(env,groupId,me.id))return bad("not a member",403); const x=await body(request); if(x?.ciphertext===undefined || !x.wrappedKeys || typeof x.wrappedKeys!=="object")return bad("ciphertext and wrappedKeys required");
+        const groupId=messages[1]; if(!await member(env,groupId,me.id))return bad("not a member",403); const x=await body(request); if(x?.ciphertext===undefined || !x.wrappedKeys || typeof x.wrappedKeys!=="object" || !text(x.signature,4096))return bad("ciphertext, wrappedKeys and signature required");
         const recipients=(await env.DB.prepare("SELECT user_id FROM group_members WHERE group_id=? AND user_id!=?").bind(groupId,me.id).all<{user_id:string}>()).results.map(x=>x.user_id); const keys=x.wrappedKeys as Record<string,unknown>;
-        if(!recipients.every(userId=>keys[userId] !== undefined))return bad("a wrapped key is required for every recipient"); const m:GroupMessage={id:id(),senderId:me.id,ciphertext:x.ciphertext,wrappedKeys:keys,recipients,receipts:[],createdAt:Date.now()}; await env.EPHEMERAL.put(`group:${groupId}:message:${m.id}`,JSON.stringify(m),{expirationTtl:86400}); return json({id:m.id, awaiting:recipients.length});
+        if(!recipients.every(userId=>keys[userId] !== undefined))return bad("a wrapped key is required for every recipient"); const m:GroupMessage={id:id(),senderId:me.id,ciphertext:x.ciphertext,wrappedKeys:keys,signature:x.signature as string,recipients,receipts:[],createdAt:Date.now()}; await env.EPHEMERAL.put(`group:${groupId}:message:${m.id}`,JSON.stringify(m),{expirationTtl:86400}); return json({id:m.id, awaiting:recipients.length});
       }
-      if (messages && request.method === "GET") { const groupId=messages[1]; if(!await member(env,groupId,me.id))return bad("not a member",403); const listed=await env.EPHEMERAL.list({prefix:`group:${groupId}:message:`,limit:100}); const out=[]; for(const k of listed.keys){const m=await env.EPHEMERAL.get<GroupMessage>(k.name,"json"); if(!m)continue; const released=m.recipients.every(r=>m.receipts.includes(r)); out.push({id:m.id,senderId:m.senderId,ciphertext:m.ciphertext,released,wrappedKey:released?m.wrappedKeys[me.id]:undefined,createdAt:m.createdAt,receipts:m.receipts.length,expected:m.recipients.length});} return json(out.sort((a,b)=>a.createdAt-b.createdAt)); }
+      if (messages && request.method === "GET") { const groupId=messages[1]; if(!await member(env,groupId,me.id))return bad("not a member",403); const listed=await env.EPHEMERAL.list({prefix:`group:${groupId}:message:`,limit:100}); const out=[]; for(const k of listed.keys){const m=await env.EPHEMERAL.get<GroupMessage>(k.name,"json"); if(!m)continue; const released=m.recipients.every(r=>m.receipts.includes(r)); out.push({id:m.id,senderId:m.senderId,ciphertext:m.ciphertext,signature:m.signature,released,wrappedKey:released?m.wrappedKeys[me.id]:undefined,createdAt:m.createdAt,receipts:m.receipts.length,expected:m.recipients.length});} return json(out.sort((a,b)=>a.createdAt-b.createdAt)); }
       const receipt=path.match(/^\/api\/groups\/([\w-]+)\/messages\/([\w-]+)\/receipt$/);
       if(receipt && request.method==="POST"){const [groupId,messageId]=[receipt[1],receipt[2]];if(!await member(env,groupId,me.id))return bad("not a member",403);const m=await message(env,groupId,messageId);if(!m)return bad("message not found",404);if(!m.recipients.includes(me.id))return bad("sender cannot acknowledge",403);if(!m.receipts.includes(me.id)){m.receipts.push(me.id);await env.EPHEMERAL.put(`group:${groupId}:message:${messageId}`,JSON.stringify(m),{expirationTtl:86400});}return json({ok:true,released:m.recipients.every(r=>m.receipts.includes(r))});}
       return bad("not found",404);
